@@ -36,13 +36,13 @@ import gevent
 import json
 import logging
 import os
+import random
 import redis
 import redis.connection
 import requests
 import socket
 import sys
 import time
-from base64 import b32decode
 from binascii import hexlify, unhexlify
 from collections import Counter
 from ConfigParser import ConfigParser
@@ -50,7 +50,7 @@ from geoip2.errors import AddressNotFoundError
 from ipaddress import ip_address, ip_network
 
 from protocol import (
-    ONION_PREFIX,
+    ONION_V3_LEN,
     TO_SERVICES,
     Connection,
     ConnectionError,
@@ -69,16 +69,19 @@ ASN = geoip2.database.Reader("geoip/GeoLite2-ASN.mmdb")
 
 def enumerate_node(redis_pipe, addr_msgs, now):
     """
-    Adds all peering nodes with max. age of 24 hours into the crawl set.
+    Adds all peering nodes with age <= max. age into the crawl set.
     """
     peers = 0
+    excluded = 0
 
     for addr_msg in addr_msgs:
         if 'addr_list' in addr_msg:
             for peer in addr_msg['addr_list']:
+                if peer['onion'] and len(peer['onion']) == ONION_V3_LEN:
+                    logging.debug("onion v3 node: %s", peer)
+
                 age = now - peer['timestamp']  # seconds
 
-                # Add peering node with age <= 24 hours into crawl set
                 if age >= 0 and age <= CONF['max_age']:
                     address = peer['ipv4'] or peer['ipv6'] or peer['onion']
                     port = peer['port'] if peer['port'] > 0 else CONF['port']
@@ -86,12 +89,15 @@ def enumerate_node(redis_pipe, addr_msgs, now):
                     if not address:
                         continue
                     if is_excluded(address):
-                        logging.debug("Exclude: %s", address)
+                        logging.debug("Exclude: (%s, %d)", address, port)
+                        excluded += 1
                         continue
                     redis_pipe.sadd('pending', (address, port, services))
                     peers += 1
+                    if peers >= CONF['peers_per_node']:
+                        return (peers, excluded)
 
-    return peers
+    return (peers, excluded)
 
 
 def connect(redis_conn, key):
@@ -103,7 +109,7 @@ def connect(redis_conn, key):
     4) Receive addr message containing list of peering nodes
     Stores state and height for node in Redis.
     """
-    handshake_msgs = []
+    version_msg = {}
     addr_msgs = []
 
     redis_conn.set(key, "")  # Set Redis key for a new node
@@ -116,7 +122,7 @@ def connect(redis_conn, key):
 
     proxy = None
     if address.endswith(".onion"):
-        proxy = CONF['tor_proxy']
+        proxy = random.choice(CONF['tor_proxies'])
 
     conn = Connection((address, int(port)),
                       (CONF['source_address'], 0),
@@ -132,12 +138,12 @@ def connect(redis_conn, key):
     try:
         logging.debug("Connecting to %s", conn.to_addr)
         conn.open()
-        handshake_msgs = conn.handshake()
+        version_msg = conn.handshake()
     except (ProtocolError, ConnectionError, socket.error) as err:
         logging.debug("%s: %s", conn.to_addr, err)
 
     redis_pipe = redis_conn.pipeline()
-    if len(handshake_msgs) > 0:
+    if version_msg:
         try:
             conn.getaddr(block=False)
         except (ProtocolError, ConnectionError, socket.error) as err:
@@ -148,7 +154,7 @@ def connect(redis_conn, key):
                 addr_wait += 1
                 gevent.sleep(0.3)
                 try:
-                    msgs = conn.get_messages(commands=['addr'])
+                    msgs = conn.get_messages(commands=['addr', 'addrv2'])
                 except (ProtocolError, ConnectionError, socket.error) as err:
                     logging.debug("%s: %s", conn.to_addr, err)
                     break
@@ -156,7 +162,6 @@ def connect(redis_conn, key):
                     addr_msgs = msgs
                     break
 
-        version_msg = handshake_msgs[0]
         from_services = version_msg.get('services', 0)
         if from_services != services:
             logging.debug("%s Expected %d, got %d for services", conn.to_addr,
@@ -166,8 +171,9 @@ def connect(redis_conn, key):
         redis_pipe.setex(height_key, CONF['max_age'],
                          version_msg.get('height', 0))
         now = int(time.time())
-        peers = enumerate_node(redis_pipe, addr_msgs, now)
-        logging.debug("%s Peers: %d", conn.to_addr, peers)
+        (peers, excluded) = enumerate_node(redis_pipe, addr_msgs, now)
+        logging.debug("%s Peers: %d (Excluded: %d)",
+                      conn.to_addr, peers, excluded)
         redis_pipe.set(key, "")
         redis_pipe.sadd('up', key)
     conn.close()
@@ -181,6 +187,7 @@ def dump(timestamp, nodes):
     """
     json_data = []
 
+    logging.info('Building JSON data')
     for node in nodes:
         (address, port, services) = node[5:].split("-", 2)
         height_key = "height:{}-{}-{}".format(address, port, services)
@@ -190,6 +197,7 @@ def dump(timestamp, nodes):
             logging.warning("%s missing", height_key)
             height = 0
         json_data.append([address, int(port), int(services), height])
+    logging.info('Built JSON data: %d', len(json_data))
 
     if len(json_data) == 0:
         logging.warning("len(json_data): %d", len(json_data))
@@ -356,8 +364,19 @@ def is_excluded(address):
     Returns True if address is found in exclusion list, False if otherwise.
     """
     if address.endswith(".onion"):
-        address = onion_to_ipv6(address)
-    elif ip_address(unicode(address)).is_private:
+        return False
+
+    if ip_address(unicode(address)).is_private:
+        return True
+
+    try:
+        asn_record = ASN.asn(address)
+    except AddressNotFoundError:
+        asn = None
+    else:
+        asn = 'AS{}'.format(asn_record.autonomous_system_number)
+
+    if CONF['include_asns'] and asn not in CONF['include_asns']:
         return True
 
     if ":" in address:
@@ -368,13 +387,6 @@ def is_excluded(address):
         key = 'exclude_ipv4_networks'
 
     try:
-        asn_record = ASN.asn(address)
-    except AddressNotFoundError:
-        asn = None
-    else:
-        asn = 'AS{}'.format(asn_record.autonomous_system_number)
-
-    try:
         addr = int(hexlify(socket.inet_pton(address_family, address)), 16)
     except socket.error:
         logging.warning("Bad address: %s", address)
@@ -383,18 +395,10 @@ def is_excluded(address):
     if any([(addr & net[1] == net[0]) for net in CONF[key]]):
         return True
 
-    if asn and asn in CONF['exclude_asns']:
+    if CONF['exclude_asns'] and asn in CONF['exclude_asns']:
         return True
 
     return False
-
-
-def onion_to_ipv6(address):
-    """
-    Returns IPv6 equivalent of an .onion address.
-    """
-    ipv6_bytes = ONION_PREFIX + b32decode(address[:-6], True)
-    return socket.inet_ntop(socket.AF_INET6, ipv6_bytes)
 
 
 def list_excluded_networks(txt, networks=None):
@@ -418,21 +422,41 @@ def list_excluded_networks(txt, networks=None):
 
 def update_excluded_networks():
     """
-    Adds bogons into the excluded IPv4 networks.
+    Adds bogons into the excluded IPv4 and IPv6 networks.
     """
-    if not CONF['exclude_ipv4_bogons']:
-        return
-    url = "http://www.team-cymru.org/Services/Bogons/fullbogons-ipv4.txt"
-    try:
-        response = requests.get(url, timeout=15)
-    except requests.exceptions.RequestException as err:
-        logging.warning(err)
-    else:
-        if response.status_code == 200:
-            CONF['exclude_ipv4_networks'] = list_excluded_networks(
-                response.content,
-                networks=CONF['initial_exclude_ipv4_networks'])
-            logging.info("%d", len(CONF['exclude_ipv4_networks']))
+    if CONF['exclude_ipv4_bogons']:
+        urls = [
+            "http://www.team-cymru.org/Services/Bogons/fullbogons-ipv4.txt",
+        ]
+        for url in urls:
+            try:
+                response = requests.get(url, timeout=15)
+            except requests.exceptions.RequestException as err:
+                logging.warning(err)
+            else:
+                if response.status_code == 200:
+                    CONF['exclude_ipv4_networks'] = list_excluded_networks(
+                        response.content,
+                        networks=CONF['exclude_ipv4_networks'])
+                    logging.info("IPv4: %d",
+                                 len(CONF['exclude_ipv4_networks']))
+
+    if CONF['exclude_ipv6_bogons']:
+        urls = [
+            "http://www.team-cymru.org/Services/Bogons/fullbogons-ipv6.txt",
+        ]
+        for url in urls:
+            try:
+                response = requests.get(url, timeout=15)
+            except requests.exceptions.RequestException as err:
+                logging.warning(err)
+            else:
+                if response.status_code == 200:
+                    CONF['exclude_ipv6_networks'] = list_excluded_networks(
+                        response.content,
+                        networks=CONF['exclude_ipv6_networks'])
+                    logging.info("IPv6: %d",
+                                 len(CONF['exclude_ipv6_networks']))
 
 
 def init_conf(argv):
@@ -457,13 +481,22 @@ def init_conf(argv):
     CONF['cron_delay'] = conf.getint('crawl', 'cron_delay')
     CONF['snapshot_delay'] = conf.getint('crawl', 'snapshot_delay')
     CONF['max_age'] = conf.getint('crawl', 'max_age')
+    CONF['peers_per_node'] = conf.getint('crawl', 'peers_per_node')
     CONF['ipv6'] = conf.getboolean('crawl', 'ipv6')
     CONF['ipv6_prefix'] = conf.getint('crawl', 'ipv6_prefix')
     CONF['nodes_per_ipv6_prefix'] = conf.getint('crawl',
                                                 'nodes_per_ipv6_prefix')
 
-    CONF['exclude_asns'] = conf.get('crawl',
-                                    'exclude_asns').strip().split("\n")
+    # include_* takes precedence over exclude_* if set
+    CONF['include_asns'] = None
+    include_asns = conf.get('crawl', 'include_asns').strip()
+    if include_asns:
+        CONF['include_asns'] = set(include_asns.split("\n"))
+
+    CONF['exclude_asns'] = None
+    exclude_asns = conf.get('crawl', 'exclude_asns').strip()
+    if exclude_asns:
+        CONF['exclude_asns'] = set(exclude_asns.split("\n"))
 
     CONF['exclude_ipv4_networks'] = list_excluded_networks(
         conf.get('crawl', 'exclude_ipv4_networks'))
@@ -472,14 +505,15 @@ def init_conf(argv):
 
     CONF['exclude_ipv4_bogons'] = conf.getboolean('crawl',
                                                   'exclude_ipv4_bogons')
-
-    CONF['initial_exclude_ipv4_networks'] = CONF['exclude_ipv4_networks']
+    CONF['exclude_ipv6_bogons'] = conf.getboolean('crawl',
+                                                  'exclude_ipv6_bogons')
 
     CONF['onion'] = conf.getboolean('crawl', 'onion')
-    CONF['tor_proxy'] = None
+    CONF['tor_proxies'] = []
     if CONF['onion']:
-        tor_proxy = conf.get('crawl', 'tor_proxy').split(":")
-        CONF['tor_proxy'] = (tor_proxy[0], int(tor_proxy[1]))
+        tor_proxies = conf.get('crawl', 'tor_proxies').strip().split("\n")
+        CONF['tor_proxies'] = [
+            (p.split(":")[0], int(p.split(":")[1])) for p in tor_proxies]
     CONF['onion_nodes'] = conf.get('crawl', 'onion_nodes').strip().split("\n")
 
     CONF['include_checked'] = conf.getboolean('crawl', 'include_checked')

@@ -34,6 +34,7 @@ import glob
 import hashlib
 import logging
 import os
+import random
 import socket
 import sys
 import time
@@ -121,9 +122,13 @@ class Cache(object):
                     src = (stream_id[0], stream_id[1])
                     dst = (stream_id[2], stream_id[3])
                     node = src
-                    if src == CONF['tor_proxy']:
+                    is_tor = False
+                    if src in CONF['tor_proxies']:
+                        # dst port will be used to restore .onion node.
                         node = dst
-                    self.cache_message(node, self.stream.timestamp, msg)
+                        is_tor = True
+                    self.cache_message(
+                        node, self.stream.timestamp, msg, is_tor=is_tor)
         self.redis_pipe.execute()
         self.cache_rtt()
 
@@ -159,17 +164,17 @@ class Cache(object):
                     timestamp = int(timestamp * 1000)  # in ms
                     self.streams[stream_id].put(
                         (tcp_pkt.seq, (timestamp, tcp_pkt)))
-        logging.info("Streams: %d", len(self.streams))
+        logging.debug("Streams: %d", len(self.streams))
 
-    def cache_message(self, node, timestamp, msg):
+    def cache_message(self, node, timestamp, msg, is_tor=False):
         """
         Caches inv/pong message from the specified node.
         """
         if msg['command'] not in ["inv", "pong"]:
             return
 
-        if node[0] == "127.0.0.1":
-            # Restore .onion node
+        # Restore .onion node using port info from node
+        if is_tor:
             onion_node = REDIS_CONN.get("onion:{}".format(node[1]))
             if onion_node:
                 node = eval(onion_node)
@@ -237,7 +242,7 @@ def cron():
         try:
             oldest = min(glob.iglob("{}/*.pcap".format(CONF['pcap_dir'])))
         except ValueError as err:
-            logging.warning(err)
+            logging.debug(err)
             continue
         latest = max(glob.iglob("{}/*.pcap".format(CONF['pcap_dir'])))
         if oldest == latest:
@@ -247,19 +252,20 @@ def cron():
         try:
             os.rename(tmp, dump)  # Mark file as being read
         except OSError as err:
-            logging.warning(err)
+            logging.debug(err)
             continue
 
-        logging.info("Loading: %s", dump)
-
-        start = time.time()
-        cache = Cache(filepath=dump)
-        cache.cache_messages()
-        end = time.time()
-        elapsed = end - start
-
-        logging.info("Dump: %s (%d messages)", dump, cache.count)
-        logging.info("Elapsed: %d", elapsed)
+        if 0 in random.sample(range(0, 100), CONF['sampling_rate']):
+            logging.debug("Loading: %s", dump)
+            start = time.time()
+            cache = Cache(filepath=dump)
+            cache.cache_messages()
+            end = time.time()
+            elapsed = end - start
+            logging.info("Dump: %s (%d messages)", dump, cache.count)
+            logging.debug("Elapsed: %d", elapsed)
+        else:
+            logging.debug("Dropped: %s", tmp)
 
         os.remove(dump)
 
@@ -278,12 +284,15 @@ def init_conf(argv):
     CONF['rtt_count'] = conf.getint('pcap', 'rtt_count')
     CONF['inv_count'] = conf.getint('pcap', 'inv_count')
 
-    tor_proxy = conf.get('pcap', 'tor_proxy').split(":")
-    CONF['tor_proxy'] = (tor_proxy[0], int(tor_proxy[1]))
+    tor_proxies = conf.get('pcap', 'tor_proxies').strip().split("\n")
+    CONF['tor_proxies'] = [
+        (p.split(":")[0], int(p.split(":")[1])) for p in tor_proxies]
 
     CONF['pcap_dir'] = conf.get('pcap', 'pcap_dir')
     if not os.path.exists(CONF['pcap_dir']):
         os.makedirs(CONF['pcap_dir'])
+
+    CONF['sampling_rate'] = conf.getint('pcap', 'sampling_rate')
 
 
 def main(argv):

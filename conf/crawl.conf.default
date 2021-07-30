@@ -16,8 +16,10 @@ db = 0
 seeders =
     dnsseed.bitcoin.dashjr.org
     dnsseed.bluematt.me
-    seed.bitcoin.jonasschnelli.ch
+    dnsseed.emzy.de
     seed.bitcoin.sipa.be
+    seed.bitcoin.sprovoost.nl
+    seed.bitcoin.wiz.biz
     seed.bitcoinstats.com
     seed.btc.petertodd.org
     seed.bitnodes.io
@@ -32,7 +34,7 @@ debug = False
 source_address = 0.0.0.0
 
 # Protocol version to use for outgoing version message
-protocol_version = 70015
+protocol_version = 70016
 
 # User agent (BIP 0014) to use for outgoing version message
 # -----------------------------------------------------------------------------
@@ -41,7 +43,7 @@ protocol_version = 70015
 # crawler. This is so that users will not confuse your crawler with another
 # instance that is already running and generating data for the project.
 # -----------------------------------------------------------------------------
-user_agent = /bitnodes.earn.com:0.1/
+user_agent = /bitnodes.io:0.2/
 
 # Services to use for outgoing network address message
 services = 0
@@ -50,7 +52,7 @@ services = 0
 relay = 0
 
 # Socket timeout
-socket_timeout = 30
+socket_timeout = 15
 
 # Run cron tasks every given interval
 cron_delay = 10
@@ -59,7 +61,10 @@ cron_delay = 10
 snapshot_delay = 240
 
 # Max. age for peering node to be included in crawl set
-max_age = 86400
+max_age = 28800
+
+# Limit max. peers per node to be included in crawl set
+peers_per_node = 500
 
 # Attempt to establish connection with IPv6 nodes
 ipv6 = True
@@ -67,6 +72,9 @@ ipv6 = True
 # Limit max. nodes per IPv6 network prefix
 ipv6_prefix = 64
 nodes_per_ipv6_prefix = 1
+
+# List of included ASNs
+include_asns =
 
 # List of excluded ASNs
 exclude_asns =
@@ -102,11 +110,15 @@ exclude_ipv6_networks =
 # Exclude IPv4 bogons
 exclude_ipv4_bogons = True
 
+# Exclude IPv6 bogons
+exclude_ipv6_bogons = False
+
 # Attempt to establish connection with .onion nodes
 onion = True
 
 # Tor proxy is required to connect to .onion address
-tor_proxy = 127.0.0.1:9050
+tor_proxies =
+    127.0.0.1:9050
 
 # List of initial .onion nodes
 onion_nodes =
@@ -131,7 +143,7 @@ onion_nodes =
     xdnigz4qn5dbbw2t.onion
     zy3kdqowmrb7xm7h.onion
 
-# Include reachable nodes from https://bitnodes.earn.com/#join-the-network
+# Include reachable nodes from https://bitnodes.io/#join-the-network
 include_checked = False
 
 # Relative path to directory containing timestamp-prefixed JSON crawl files
